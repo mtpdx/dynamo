@@ -1,0 +1,165 @@
+# LLM 推理服务平台文档
+
+基于 NVIDIA Dynamo + LiteLLM 构建的企业级 LLM 推理服务平台。
+
+## 文档索引
+
+### 核心文档
+
+| 文档 | 内容 | 说明 |
+|------|------|------|
+| **architecture-design.md** | 完整架构设计 | V2.0 版本，已根据评审优化 |
+| **README.md** | Dynamo 生产最佳实践 | 基于 Dynamo 项目的最佳实践 |
+| **litellm-integration.md** | LiteLLM 集成方案 | 评估报告和集成指南 |
+
+### 快速参考
+
+| 文档 | 内容 |
+|------|------|
+| **quick-reference.md** | 配置模板和命令参考 |
+| **aiconfigurator-guide.md** | AIConfigurator 使用指南 |
+| **production-best-practices.md** | 生产最佳实践 |
+
+---
+
+## V2.0 架构设计核心变更
+
+### 主要优化
+
+| # | 变更 | 原因 |
+|---|------|------|
+| 1 | 部署 API 简化为「性能等级」 | 原 API 暴露 Kubernetes 细节，用户门槛高 |
+| 2 | 引入 LiteLLM Gateway 双层架构 | 补全推理 API、OpenAI 兼容、限流、成本跟踪 |
+| 3 | 引入异步 Job 机制 | 部署/扩缩容等长时操作需要异步化 |
+| 4 | 增加部署模板市场 | 减少用户重复配置 |
+| 5 | 简化 API Gateway 选型 | apisix 替代 Kong，轻量且功能足够 |
+| 6 | 明确 MVP 范围 | 聚焦核心路径，延后高级功能 |
+
+### 新架构图
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    API Gateway (apisix)                         │
+│                   认证 / 鉴权 / 限流                              │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+        ▼                     ▼                     ▼
+┌───────────────┐    ┌─────────────────┐    ┌───────────────┐
+│  Go Backend  │    │    LiteLLM      │    │   内部服务    │
+│   (管理面)    │    │   (推理面)       │    │  Dynamo/NATS │
+│               │    │                 │    │               │
+│ 租户/模型/部署 │    │ OpenAI 兼容 API │    │  LLM 推理    │
+│ 配额/审计/作业 │    │ 成本/限流/缓存  │    │  执行        │
+└───────────────┘    └─────────────────┘    └───────────────┘
+```
+
+---
+
+## 快速导航
+
+### 场景 1：理解平台架构
+
+1. 阅读 [architecture-design.md](./architecture-design.md) 第 1-2 章
+2. 了解 [API 分层](./architecture-design.md#4-api-接口设计)
+3. 查看 [技术栈](./architecture-design.md#9-技术栈)
+
+### 场景 2：部署一个模型
+
+1. 使用部署模板或性能等级创建部署
+2. 查看 [创建部署 API](./architecture-design.md#51-创建部署简化-api)
+3. 查询 [作业状态](./architecture-design.md#52-查询作业状态)
+
+### 场景 3：集成 OpenAI SDK
+
+1. 获取 API Key
+2. 调用 [推理 API](./architecture-design.md#55-推理-apiopenai-兼容)
+3. 参考 [LiteLLM 文档](https://docs.litellm.ai/)
+
+### 场景 4：使用 Dynamo 高级特性
+
+1. 阅读 [README.md](./README.md) 架构概述
+2. 了解 [部署模式](./README.md#2-部署架构模式)
+3. 配置 [RDMA](./README.md#5-rdma-与-kv-cache-传输)
+
+---
+
+## 核心概念
+
+### 性能等级 (Performance Tier)
+
+简化部署配置，用户只需选择等级：
+
+| 等级 | 说明 | 适用场景 |
+|------|------|----------|
+| `economy` | 最小配置 | 测试/开发 |
+| `standard` | 推荐配置 | 生产轻负载 |
+| `high_performance` | 高性能 | 生产高负载 |
+| `enterprise` | 顶级 | 大规模部署 |
+
+### 异步作业 (Job)
+
+部署、扩缩容等长时操作通过 Job 异步执行：
+
+```json
+{
+    "job_id": "job_abc123",
+    "status": "running",
+    "progress": {
+        "current_step": "creating_workers",
+        "steps_completed": 2,
+        "total_steps": 4
+    }
+}
+```
+
+### 两层配额控制
+
+```
+第一层：Go Backend（租户级强控制）
+       - 月度支出限额
+       - GPU 小时限额
+       - 部署数量限额
+
+第二层：LiteLLM（模型/Key 级细粒度）
+       - RPM / TPM 限制
+```
+
+---
+
+## API 概览
+
+### 管理面 API (:8001)
+
+| 端点 | 描述 |
+|------|------|
+| `POST /api/v1/auth/register` | 用户注册 |
+| `POST /api/v1/auth/login` | 用户登录 |
+| `POST /api/v1/models` | 创建模型 |
+| `GET /api/v1/models` | 模型列表 |
+| `POST /api/v1/deployments` | 创建部署 |
+| `GET /api/v1/deployments/:id` | 部署详情 |
+| `POST /api/v1/deployments/:id/scale` | 扩缩容 |
+| `GET /api/v1/jobs/:id` | 作业状态 |
+| `GET /api/v1/templates` | 部署模板 |
+
+### 推理面 API (:4000)
+
+OpenAI 100% 兼容：
+
+| 端点 | 描述 |
+|------|------|
+| `POST /v1/chat/completions` | Chat 对话 |
+| `POST /v1/completions` | Text Completion |
+| `POST /v1/embeddings` | 向量嵌入 |
+| `GET /v1/models` | 可用模型 |
+
+---
+
+## 更新日志
+
+| 版本 | 日期 | 变更 |
+|------|------|------|
+| V1.0 | 2026-01-30 | 初始版本 |
+| V2.0 | 2026-01-30 | 根据评审优化：LiteLLM 集成、简化 API、异步 Job、部署模板 |
