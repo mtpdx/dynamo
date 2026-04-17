@@ -81,9 +81,8 @@
 
 | 层级 | llm-platform 设计 | Dynamo 原生 | 差距分析 |
 |------|-------------------|-------------|----------|
-| 接入层 | API Gateway (apisix) | 无 | ✅ 增强设计 |
-| 管理面 | Go Backend | 无 | ✅ 自研 |
-| 推理面 | LiteLLM Gateway | Frontend | ⚠️ 需确认是否必要 |
+| 接入层 | Web UI / SDK (客户端) | 无 | ✅ 简化设计 |
+| 同层级服务 | Go Backend + LiteLLM | Frontend | ✅ 双引擎服务 |
 | 执行层 | Dynamo | Dynamo | ✅ 保持一致 |
 | 数据层 | PostgreSQL + Redis | etcd + NATS | ⚠️ 需统一存储设计 |
 
@@ -132,25 +131,24 @@ POST /deployments/advanced  // 完整配置模式
 
 **问题分析**：
 
-1. **路由复杂度增加**
-   - Client → API Gateway → LiteLLM → Dynamo Frontend → Worker
-   - 5 层代理，可能影响延迟
+1. **路由复杂度**
+   - V3.0 已移除 API Gateway，简化架构
+   - Client → Go Backend / LiteLLM Gateway → Dynamo
 
-2. **LiteLLM 必要性存疑**
-   - Dynamo Frontend 本身已经提供 OpenAI 兼容 API
-   - 需要评估 LiteLLM 的额外价值（多模型路由、成本日志）
+2. **LiteLLM 必要性**
+   - Dynamo Frontend 本身已提供 OpenAI 兼容 API
+   - 保留 LiteLLM 用于：多模型路由、成本日志、细粒度限流
 
-**建议**：
+**V3.0 架构**：
 
 ```
-方案 A（推荐）：简化架构
-Client → API Gateway → Dynamo Frontend → Workers
-- 使用 Dynamo 原生 Frontend
-- API Gateway 负责认证/鉴权/限流
-
-方案 B：保留 LiteLLM
-Client → API Gateway → LiteLLM → Dynamo Frontend → Workers
-- 仅在需要多模型统一管理时使用
+Web UI / SDK / OpenAI SDK
+        │
+        ├──→ Go Backend (:8001) ─→ Dynamo
+        │     管理面：认证/鉴权/模型/部署/配额
+        │
+        └──→ LiteLLM Gateway (:4000) ─→ Dynamo
+              推理面：OpenAI 兼容/成本/限流
 ```
 
 ---
@@ -313,8 +311,8 @@ func (w *JobWorker) processJob(job *Job) error {
 **建议改进**：
 
 ```go
-// 建议 1: 配额检查前置到 API Gateway
-// API Gateway 层直接检查 token 配额，减少无谓的请求路由
+// 建议 1: 配额检查前置到 Go Backend
+// Go Backend 层直接检查 token 配额，减少无谓的请求路由
 type QuotaCheckResult struct {
     Allowed        bool
     Remaining      int64
@@ -462,15 +460,13 @@ metrics:
 
 ### 9.2 关键建议优先级
 
-**P0（必须）**：
+**P0（已完成 in V3.0）**：
 
-1. **LiteLLM 必要性评估**
-   - 如果仅需要 OpenAI 兼容，考虑直接使用 Dynamo Frontend
-   - 如果需要多模型统一管理，保留 LiteLLM
+1. ~~LiteLLM 必要性评估~~ → **已决策：保留 LiteLLM**，用于多模型路由、成本日志、细粒度限流
 
-2. **API Gateway 位置**
-   - 当前设计：Client → API GW → Go Backend → Dynamo
-   - 建议：合并 Go Backend 和 API GW，减少一跳
+2. ~~API Gateway 位置~~ → **已移除 API Gateway**：
+   - Go Backend 和 LiteLLM Gateway 同层级
+   - 简化架构，减少代理层
 
 **P1（重要）**：
 
@@ -520,15 +516,15 @@ llm-platform 的架构设计整体**优秀**，充分借鉴了 Dynamo 的核心�
 
 ### 10.2 核心建议
 
-1. **简化架构**：评估是否可以减少代理层
+1. ~~**简化架构**~~：V3.0 已移除 API Gateway
 2. **增强作业系统**：支持优先级、依赖、幂等性
 3. **完善配额体系**：多维度、细粒度
 4. **安全加固**：网络策略、API 安全
 
 ### 10.3 下一步行动
 
-- [ ] LiteLLM 必要性评估（2 天）
-- [ ] API Gateway 与 Go Backend 合并方案设计（3 天）
+- [x] ~~LiteLLM 必要性评估~~ → 已决策：保留
+- [x] ~~API Gateway 移除~~ → V3.0 已完成
 - [ ] 异步作业增强详细设计（5 天）
 - [ ] 配额系统细化设计（3 天）
 
