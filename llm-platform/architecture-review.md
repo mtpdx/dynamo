@@ -2,7 +2,6 @@
 
 **评审日期**：2026-01-30  
 **评审人**：LLM 平台架构师 & 产品经理  
-**评审版本**：llm-platform V2.0 架构设计文档  
 **评审范围**：Dynamo 核心架构 + llm-platform 架构设计
 
 ---
@@ -44,7 +43,7 @@
 | DynamoGraphDeploymentRequest | SLA 驱动部署 | ✅ 用户友好 |
 | DynamoGraphDeploymentScalingAdapter | 扩缩容适配器 | ✅ HPA/KEDA 集成 |
 
-### 1.3 部署模式演进
+### 1.3 部署模式
 
 | 模式 | 适用场景 | 复杂度 | 推荐度 |
 |------|----------|--------|--------|
@@ -64,23 +63,24 @@
 
 1. **分层清晰**：接入层 → 管理面 → 推理面 → 执行层 → 数据层，职责边界明确
 2. **API First 设计**：管理面 8001 + 推理面 4000，OpenAI 兼容
-3. **LiteLLM 集成**：利用开源方案减少重复开发
+3. **LiteLLM 集成**：利用开源方案减少重复开发，多模型路由能力
 4. **性能等级抽象**：封装 Dynamo 复杂配置为「性能等级」概念，降低用户门槛
+5. **同层级服务设计**：Go Backend 和 LiteLLM Gateway 并列服务，简化架构
 
-**需改进之处**：
+**需关注之处**：
 
-1. **LiteLLM Gateway 位置问题**
-   - 当前设计将 LiteLLM 放在推理面，可能导致双重代理开销
-   - 建议：评估是否可以直接使用 Dynamo Frontend 的路由能力
-
-2. **Go Backend 职责过重**
+1. **Go Backend 职责**
    - 当前设计：租户管理 + 部署管理 + 配额控制 + 作业管理 + 审计
    - 建议：考虑拆分为多个微服务或引入消息队列解耦
 
+2. **LiteLLM 必要性**
+   - Dynamo Frontend 本身已提供 OpenAI 兼容 API
+   - 保留 LiteLLM 用于：多模型路由、成本日志、细粒度限流
+
 ### 2.2 架构分层对比
 
-| 层级 | llm-platform 设计 | Dynamo 原生 | 差距分析 |
-|------|-------------------|-------------|----------|
+| 层级 | llm-platform 设计 | Dynamo 原生 | 评价 |
+|------|-------------------|-------------|------|
 | 接入层 | Web UI / SDK (客户端) | 无 | ✅ 简化设计 |
 | 同层级服务 | Go Backend + LiteLLM | Frontend | ✅ 双引擎服务 |
 | 执行层 | Dynamo | Dynamo | ✅ 保持一致 |
@@ -129,26 +129,14 @@ POST /deployments/advanced  // 完整配置模式
 - 直接透传到 LiteLLM
 - OpenAI 100% 兼容
 
-**问题分析**：
-
-1. **路由复杂度**
-   - V3.0 已移除 API Gateway，简化架构
-   - Client → Go Backend / LiteLLM Gateway → Dynamo
-
-2. **LiteLLM 必要性**
-   - Dynamo Frontend 本身已提供 OpenAI 兼容 API
-   - 保留 LiteLLM 用于：多模型路由、成本日志、细粒度限流
-
-**V3.0 架构**：
+**建议**：
 
 ```
-Web UI / SDK / OpenAI SDK
-        │
-        ├──→ Go Backend (:8001) ─→ Dynamo
-        │     管理面：认证/鉴权/模型/部署/配额
-        │
-        └──→ LiteLLM Gateway (:4000) ─→ Dynamo
-              推理面：OpenAI 兼容/成本/限流
+架构建议：
+Web UI / SDK → Go Backend (:8001) → Dynamo
+              → LiteLLM Gateway (:4000) → Dynamo
+
+LiteLLM 用于：多模型统一路由、成本日志、细粒度限流
 ```
 
 ---
@@ -241,24 +229,24 @@ ratelimit:{tenant_id}:{model_id}:{endpoint} → {count, window_start}
 type Job struct {
     Priority    int       `json:"priority"`    // 0-9, 9 最高
     MaxRetries int       `json:"max_retries"` // 失败重试次数
-    RetryDelay Duration  `json:"retry_delay"`// 重试间隔
+    RetryDelay Duration  `json:"retry_delay"` // 重试间隔
 }
 
 // 建议 2: 增加作业依赖
 type JobDependency struct {
     JobID       string
     DependsOn   []string  // 前置作业列表
-    WaitTimeout Duration  // 等待超时
+    WaitTimeout Duration   // 等待超时
 }
 
 // 建议 3: 作业分类
 const (
     JobTypeDeploymentCreate  = "deployment_create"
     JobTypeDeploymentScale   = "deployment_scale"
-    JobTypeDeploymentUpdate   = "deployment_update"    // 新增
+    JobTypeDeploymentUpdate   = "deployment_update"
     JobTypeDeploymentDelete   = "deployment_delete"
     JobTypeModelImport        = "model_import"
-    JobTypeModelVersionCreate = "model_version_create" // 新增
+    JobTypeModelVersionCreate = "model_version_create"
 )
 ```
 
@@ -311,16 +299,7 @@ func (w *JobWorker) processJob(job *Job) error {
 **建议改进**：
 
 ```go
-// 建议 1: 配额检查前置到 Go Backend
-// Go Backend 层直接检查 token 配额，减少无谓的请求路由
-type QuotaCheckResult struct {
-    Allowed        bool
-    Remaining      int64
-    ResetAt        time.Time
-    RetryAfterSecs int
-}
-
-// 建议 2: 配额策略细化
+// 建议 1: 配额策略细化
 type QuotaPolicy struct {
     TenantID       string
     Policies []QuotaPolicyItem
@@ -387,13 +366,6 @@ spec:
           port: 8001  # Go Backend
         - protocol: TCP
           port: 4000  # LiteLLM
-    - from:
-        - podSelector:
-            matchLabels:
-              app: dynamo-frontend
-      ports:
-        - protocol: TCP
-          port: 9090  # Worker metrics
 ```
 
 ```go
@@ -445,7 +417,7 @@ metrics:
 
 ---
 
-## 9. 总体评价与建议
+## 9. 架构成熟度与建议
 
 ### 9.1 架构成熟度评估
 
@@ -458,15 +430,7 @@ metrics:
 | 可观测 | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | 需告警闭环 |
 | 成本控制 | ⭐⭐⭐ | ⭐⭐⭐⭐⭐ | 需精细化 |
 
-### 9.2 关键建议优先级
-
-**P0（已完成 in V3.0）**：
-
-1. ~~LiteLLM 必要性评估~~ → **已决策：保留 LiteLLM**，用于多模型路由、成本日志、细粒度限流
-
-2. ~~API Gateway 位置~~ → **已移除 API Gateway**：
-   - Go Backend 和 LiteLLM Gateway 同层级
-   - 简化架构，减少代理层
+### 9.2 建议优先级
 
 **P1（重要）**：
 
@@ -480,7 +444,7 @@ metrics:
 2. **成本预估**：实时成本计算
 3. **多集群支持**：跨集群部署管理
 
-### 9.3 架构演进路线建议
+### 9.3 架构演进路线
 
 ```
 Phase 1（当前 MVP）：
@@ -511,23 +475,22 @@ Phase 3（长期目标）：
 llm-platform 的架构设计整体**优秀**，充分借鉴了 Dynamo 的核心能力，并在此基础上做了大量用户友好的抽象。核心亮点：
 
 1. **性能等级抽象**：极大降低用户门槛
-2. **分层设计**：管理面/推理面/执行面分离
+2. **分层设计**：管理面/推理面/执行面分离，同层级服务简化架构
 3. **异步作业机制**：避免长时间操作超时
+4. **LiteLLM 集成**：多模型统一路由、成本日志、细粒度限流
 
 ### 10.2 核心建议
 
-1. ~~**简化架构**~~：V3.0 已移除 API Gateway
-2. **增强作业系统**：支持优先级、依赖、幂等性
-3. **完善配额体系**：多维度、细粒度
-4. **安全加固**：网络策略、API 安全
+1. **增强作业系统**：支持优先级、依赖、幂等性
+2. **完善配额体系**：多维度、细粒度
+3. **安全加固**：网络策略、API 安全
 
 ### 10.3 下一步行动
 
-- [x] ~~LiteLLM 必要性评估~~ → 已决策：保留
-- [x] ~~API Gateway 移除~~ → V3.0 已完成
 - [ ] 异步作业增强详细设计（5 天）
 - [ ] 配额系统细化设计（3 天）
+- [ ] 安全加固方案设计（3 天）
 
 ---
 
-**评审结论**：llm-platform V2.0 架构设计**通过评审**，建议进入实现阶段。核心建议已标记 P0/P1/P2，建议按优先级逐步实施。
+**评审结论**：llm-platform 架构设计**通过评审**，建议进入实现阶段。建议按 P1/P2 优先级逐步实施增强功能。

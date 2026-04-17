@@ -1,26 +1,8 @@
 # LLM 推理服务平台 - 架构设计文档
 
-**文档版本**：V3.0  
+**文档版本**：V1.0  
 **编制日期**：2026-01-30  
-**文档状态**：移除 API Gateway，Go Backend 与 LiteLLM Gateway 同层级设计
-
----
-
-## 变更记录
-
-| 版本 | 日期 | 变更内容 |
-|------|------|----------|
-| V1.0 | 2026-01-30 | 初始版本 |
-| V2.0 | 2026-01-30 | 根据评审意见和 LiteLLM 集成方案优化架构 |
-| V3.0 | 2026-01-30 | 移除 API Gateway，Go Backend 与 LiteLLM Gateway 同层级 |
-
-### V3.0 主要变更
-
-```
-1. 【架构】移除 API Gateway (apisix)
-2. 【架构】Go Backend 与 LiteLLM Gateway 同层级，并列服务于 Web UI/SDK
-3. 【架构】认证/鉴权下沉到 Go Backend 和 LiteLLM 各自实现
-```
+**文档状态**：初版
 
 ---
 
