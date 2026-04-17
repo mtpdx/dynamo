@@ -142,6 +142,7 @@
 │                                                                        │
 │  ✅ 模型/部署生命周期管理（CRUD）                                       │
 │  ✅ DynamoGraphDeployment CRD 管理                                      │
+│  ✅ K8s CRD 状态监控（Watch 服务）                                      │
 │  ✅ 租户隔离与配额强控制（第一层拦截）                                   │
 │  ✅ 精确计量与计费                                                      │
 │  ✅ 用户/角色/权限管理                                                   │
@@ -190,8 +191,9 @@ LLM 推理服务平台
 │   ├── 2.2 更新部署
 │   ├── 2.3 扩缩容（手动/自动）
 │   ├── 2.4 部署状态监控
-│   ├── 2.5 部署模板市场
-│   └── 2.6 异步作业管理
+│   ├── 2.5 K8s CRD Watch 监控
+│   ├── 2.6 部署模板市场
+│   └── 2.7 异步作业管理
 │
 ├── 3. 推理 API (Inference API)
 │   ├── 3.1 Chat Completions (OpenAI 兼容)
@@ -1028,6 +1030,287 @@ GET /api/v1/jobs/{job_id}
 
 ---
 
+## 7.5 K8s CRD 状态监控
+
+### 7.5.1 为什么需要 Watch 服务
+
+当前设计中，Worker 创建/更新 CRD 后通过轮询或等待获取状态。但这种方式存在**状态同步盲区**：
+
+| 问题场景 | 影响 |
+|----------|------|
+| K8s 内部 Pod 拉取镜像失败 | Go Backend 不知道，用户无法感知 |
+| 节点资源不足导致调度失败 | 状态停留在 "Creating" |
+| Operator 内部错误 | 需要手动刷新才能看到最新状态 |
+| 外部直接使用 kubectl 修改 CRD | Go Backend 无法感知变更 |
+
+**Watch 服务通过 Kubernetes List/Watch API 实时监控 CRD 变更**，解决上述问题。
+
+### 7.5.2 架构设计
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        K8s CRD Watch 服务                              │
+│                                                                        │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │                    Kubernetes API Server                          │  │
+│  │                                                                    │  │
+│  │   Watch: DynamoGraphDeployment (所有命名空间)                     │  │
+│  │   Watch: DynamoComponentDeployment (所有命名空间)                 │  │
+│  │   Watch: Pod (标签筛选: app=dynamo)                             │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
+│                                   │                                     │
+│                                   ▼                                     │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │                      CRD Watch Client                             │  │
+│  │                                                                    │  │
+│  │   • 维护长连接 (HTTP/2 Watch)                                    │  │
+│  │   • 自动重连 + 增量同步                                          │  │
+│  │   • 事件队列 (FIFO)                                              │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
+│                                   │                                     │
+│                                   ▼                                     │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │                      状态同步处理                                  │  │
+│  │                                                                    │  │
+│  │   • 解析 CRD 状态变更                                             │  │
+│  │   • 更新 PostgreSQL (deployments 表)                              │  │
+│  │   • 同步 Pod 状态到 Redis (deployment:status:{id})               │  │
+│  │   • 推送 WebSocket 事件到前端                                     │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.5.3 Watch 服务实现
+
+```go
+// pkg/watch/crd_watcher.go
+type CRDWatcher struct {
+    k8sClient    *kubernetes.Clientset
+    dynClient    *dynamic.DynamicClient
+    db           *gorm.DB
+    redis        *redis.Client
+    eventCh      chan *WatchEvent
+    namespaces   []string  // 要监控的命名空间
+}
+
+type WatchEvent struct {
+    EventType watch.EventType  // Added/Modified/Deleted
+    Resource  string           // CRD 类型
+    Namespace string
+    Name      string
+    Object    interface{}      // CRD 对象
+    Timestamp time.Time
+}
+
+func (w *CRDWatcher) Start(ctx context.Context) error {
+    // 启动多个 Watch goroutine
+    go w.watchDGD(ctx)       // DynamoGraphDeployment
+    go w.watchDCD(ctx)       // DynamoComponentDeployment
+    go w.watchPods(ctx)      // Pod 状态
+    
+    // 启动事件处理器
+    go w.processEvents(ctx)
+    
+    <-ctx.Done()
+    return nil
+}
+
+func (w *CRDWatcher) watchDGD(ctx context.Context) error {
+    // 获取所有租户命名空间
+    namespaces, err := w.getTenantNamespaces()
+    if err != nil {
+        return err
+    }
+    
+    for _, ns := range namespaces {
+        go w.watchInNamespace(ctx, ns, "dynamographdeployments", "nvidia.com")
+    }
+    
+    <-ctx.Done()
+    return nil
+}
+
+func (w *CRDWatcher) watchInNamespace(ctx context.Context, ns, plural, group string) error {
+    resource := schema.GroupVersionResource{
+        Group:    group,
+        Version:   "v1alpha1",
+        Resource:  plural,
+    }
+    
+    watcher, err := w.dynClient.Resource(resource).Namespace(ns).Watch(ctx, metav1.ListOptions{})
+    if err != nil {
+        return err
+    }
+    defer watcher.Stop()
+    
+    for {
+        select {
+        case <-ctx.Done():
+            return nil
+        case e := <-watcher.ResultChan():
+            w.eventCh <- &WatchEvent{
+                EventType: e.Type,
+                Resource:  plural,
+                Namespace: ns,
+                Name:      e.Object.(*unstructured.Unstructured).GetName(),
+                Object:    e.Object,
+                Timestamp: time.Now(),
+            }
+        }
+    }
+}
+```
+
+### 7.5.4 状态同步处理
+
+```go
+func (w *CRDWatcher) processEvents(ctx context.Context) {
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case e := <-w.eventCh:
+            switch e.Resource {
+            case "dynamographdeployments":
+                w.syncDGDStatus(e)
+            case "dynamocomponentdeployments":
+                w.syncDCDStatus(e)
+            case "pods":
+                w.syncPodStatus(e)
+            }
+        }
+    }
+}
+
+func (w *CRDWatcher) syncDGDStatus(e *WatchEvent) {
+    obj := e.Object.(*unstructured.Unstructured)
+    
+    // 解析状态
+    status, _ := obj.Object["status"].(map[string]interface{})
+    state, _ := status["state"].(string)
+    conditions, _ := status["conditions"].([]interface{})
+    
+    // 更新数据库
+    deploymentID := obj.GetName()
+    now := time.Now()
+    
+    w.db.Model(&Deployment{}).Where("k8s_name = ?", deploymentID).Updates(map[string]interface{}{
+        "status":         state,
+        "conditions":     conditions,
+        "last_sync_at":   now,
+    })
+    
+    // 更新 Redis 缓存
+    cacheKey := fmt.Sprintf("deployment:status:%s", deploymentID)
+    w.redis.Set(ctx, cacheKey, map[string]interface{}{
+        "status":     state,
+        "updated_at": now,
+    }, 30*time.Second)
+    
+    // 如果是 Deleted 事件，清理相关数据
+    if e.EventType == watch.Deleted {
+        w.handleDeploymentDeleted(deploymentID)
+    }
+}
+```
+
+### 7.5.5 事件推送 (可选)
+
+支持 WebSocket 实时推送状态变更到前端：
+
+```go
+// pkg/ws/hub.go
+type Hub struct {
+    clients    map[*Client]bool
+    broadcast  chan *StatusUpdate
+    register   chan *Client
+    unregister chan *Client
+}
+
+type StatusUpdate struct {
+    Type      string      `json:"type"`
+    Resource  string      `json:"resource"`   // "deployment", "component", "pod"
+    Name      string      `json:"name"`
+    Namespace string      `json:"namespace"`
+    Status    interface{} `json:"status"`
+    Timestamp time.Time   `json:"timestamp"`
+}
+
+func (h *Hub) Run() {
+    for {
+        select {
+        case update := <-h.broadcast:
+            // 广播到所有订阅该资源的客户端
+            for client := range h.clients {
+                if client.subscribed[update.Resource+"/"+update.Namespace] {
+                    client.send <- update
+                }
+            }
+        }
+    }
+}
+```
+
+### 7.5.6 错误处理与恢复
+
+```go
+func (w *CRDWatcher) watchWithRetry(ctx context.Context, watchFunc func() error) {
+    for {
+        err := watchFunc()
+        if err == nil {
+            return
+        }
+        
+        select {
+        case <-ctx.Done():
+            return
+        default:
+            // 指数退避重连
+            w.reconnectDelay = min(w.reconnectDelay*2, 5*time.Minute)
+            time.Sleep(w.reconnectDelay)
+        }
+    }
+}
+
+// List 定期同步（兜底）
+func (w *CRDWatcher) periodicSync(ctx context.Context) {
+    ticker := time.NewTicker(5 * time.Minute)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            // 全量同步所有 CRD 状态
+            w.fullSync()
+        }
+    }
+}
+```
+
+### 7.5.7 监控指标
+
+```go
+// Watch 服务相关指标
+func (w *CRDWatcher) recordMetrics() {
+    // 指标采集
+    go func() {
+        for {
+            m.watchEventsTotal.WithLabelValues("dynamographdeployment", "added")
+            m.watchEventsTotal.WithLabelValues("dynamographdeployment", "modified")
+            m.watchEventsTotal.WithLabelValues("dynamographdeployment", "deleted")
+            
+            m.watchLagSeconds.WithLabelValues("dynamographdeployment").Observe(lag)
+            
+            time.Sleep(30 * time.Second)
+        }
+    }()
+}
+```
+
+---
+
 ## 8. 配额控制机制
 
 ### 8.1 两层配额控制
@@ -1216,6 +1499,15 @@ llm-platform/
 │   │   ├── worker.go
 │   │   └── deployment.go
 │   │
+│   ├── watch/                 # K8s CRD Watch 服务
+│   │   ├── crd_watcher.go    # CRD 监控主逻辑
+│   │   ├── syncer.go         # 状态同步处理
+│   │   └── metrics.go        # Watch 指标
+│   │
+│   ├── ws/                    # WebSocket 服务
+│   │   ├── hub.go            # WebSocket Hub
+│   │   └── client.go         # 客户端管理
+│   │
 │   └── pkg/                   # 公共包
 │       ├── errors/
 │       ├── response/
@@ -1367,7 +1659,7 @@ volumes:
 |----|------|----------|--------|
 | 1-2 | 基础设施 | Go 项目框架、DB 迁移、配置管理、部署脚本 | M1 |
 | 3-4 | 认证 + 模型 | 用户认证、模型 CRUD、API Key | M1 |
-| 5-6 | 部署管理 | 创建/删除/状态、作业机制、LiteLLM 集成 | M2 |
+| 5-6 | 部署管理 | 创建/删除/状态、作业机制、LiteLLM 集成、K8s CRD Watch | M2 |
 | 7-8 | 扩缩容 + 配额 | 手动扩缩容、配额检查中间件、成本估算 | M2 |
 | 9-10 | 可观测性 | 指标暴露、Grafana Dashboard、日志集成 | M3 |
 | 11-12 | 完善 + 测试 | 单元测试、集成测试、部署模板、文档 | M3 |
