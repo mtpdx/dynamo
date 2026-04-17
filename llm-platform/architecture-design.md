@@ -1043,158 +1043,235 @@ GET /api/v1/jobs/{job_id}
 | Operator 内部错误 | 需要手动刷新才能看到最新状态 |
 | 外部直接使用 kubectl 修改 CRD | Go Backend 无法感知变更 |
 
-**Watch 服务通过 Kubernetes List/Watch API 实时监控 CRD 变更**，解决上述问题。
+**使用 client-go Informer 机制实时监控 CRD 变更**，解决上述问题。
 
-### 7.5.2 架构设计
+### 7.5.2 client-go Informer 架构
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                        K8s CRD Watch 服务                              │
-│                                                                        │
-│  ┌─────────────────────────────────────────────────────────────────┐  │
-│  │                    Kubernetes API Server                          │  │
-│  │                                                                    │  │
-│  │   Watch: DynamoGraphDeployment (所有命名空间)                     │  │
-│  │   Watch: DynamoComponentDeployment (所有命名空间)                 │  │
-│  │   Watch: Pod (标签筛选: app=dynamo)                             │  │
-│  └─────────────────────────────────────────────────────────────────┘  │
-│                                   │                                     │
-│                                   ▼                                     │
-│  ┌─────────────────────────────────────────────────────────────────┐  │
-│  │                      CRD Watch Client                             │  │
-│  │                                                                    │  │
-│  │   • 维护长连接 (HTTP/2 Watch)                                    │  │
-│  │   • 自动重连 + 增量同步                                          │  │
-│  │   • 事件队列 (FIFO)                                              │  │
-│  └─────────────────────────────────────────────────────────────────┘  │
-│                                   │                                     │
-│                                   ▼                                     │
-│  ┌─────────────────────────────────────────────────────────────────┐  │
-│  │                      状态同步处理                                  │  │
-│  │                                                                    │  │
-│  │   • 解析 CRD 状态变更                                             │  │
-│  │   • 更新 PostgreSQL (deployments 表)                              │  │
-│  │   • 同步 Pod 状态到 Redis (deployment:status:{id})               │  │
-│  │   • 推送 WebSocket 事件到前端                                     │  │
-│  └─────────────────────────────────────────────────────────────────┘  │
+│                        Kubernetes API Server                             │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    │ List + Watch
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           Reflector                                     │
+│  • List 获取全量数据                                                    │
+│  • Watch 增量监控                                                       │
+│  • 将变更写入 DeltaFIFO                                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           DeltaFIFO                                     │
+│  • 队列存储: Add/Update/Delete 变更                                    │
+│  • 键值: namespace/name                                                 │
+│  • 出队后触发 Handler                                                   │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          Store (本地缓存)                               │
+│  • Thread-safe 的本地缓存                                               │
+│  • 无需每次查询 API Server                                              │
+│  • 支持 Index 加速查询                                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      SharedInformerFactory                              │
+│  • 管理多个 Informer 生命周期                                           │
+│  • 共享 Reflector 和 Store                                             │
+│  • 等待缓存同步完成                                                     │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.5.3 Watch 服务实现
+### 7.5.3 架构设计
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      K8s CRD Watch 服务                                  │
+│                                                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │                    SharedInformerFactory                            │  │
+│  │                                                                    │  │
+│  │   • DGD Informer (DynamoGraphDeployment)                          │  │
+│  │   • DCD Informer (DynamoComponentDeployment)                       │  │
+│  │   • Pod Informer (标签: app=dynamo)                               │  │
+│  │   • 自动重连 + 缓存同步                                             │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                   │                                     │
+│                                   ▼                                     │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │                      状态同步处理                                    │  │
+│  │                                                                    │  │
+│  │   • 解析 CRD 状态变更 (来自 DeltaFIFO)                             │  │
+│  │   • 更新 PostgreSQL (deployments 表)                               │  │
+│  │   • 同步 Pod 状态到 Redis                                          │  │
+│  │   • 推送 WebSocket 事件到前端                                     │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.5.4 Informer 实现
 
 ```go
-// pkg/watch/crd_watcher.go
+// internal/watch/crd_watcher.go
+
+// CRD 配置
+var (
+    // DynamoGraphDeployment GVR
+    DGDGVR = schema.GroupVersionResource{
+        Group:    "nvidia.com",
+        Version:  "v1alpha1",
+        Resource: "dynamographdeployments",
+    }
+    
+    // DynamoComponentDeployment GVR
+    DCDGVR = schema.GroupVersionResource{
+        Group:    "nvidia.com",
+        Version:  "v1alpha1",
+        Resource: "dynamocomponentdeployments",
+    }
+)
+
+// CRDWatcher 核心结构
 type CRDWatcher struct {
-    k8sClient    *kubernetes.Clientset
-    dynClient    *dynamic.DynamicClient
+    ctx         context.Context
+    cancel       context.CancelFunc
+    
+    // Dynamic client 用于 CRD
+    dynClient    dynamic.Interface
+    
+    // 标准的 K8s client-go informers
+    sharedFactory   informers.SharedInformerFactory
+    deploymentInformer   cache.SharedIndexInformer
+    componentInformer    cache.SharedIndexInformer
+    podInformer          cache.SharedIndexInformer
+    
+    // 数据库和缓存
     db           *gorm.DB
     redis        *redis.Client
-    eventCh      chan *WatchEvent
-    namespaces   []string  // 要监控的命名空间
-}
-
-type WatchEvent struct {
-    EventType watch.EventType  // Added/Modified/Deleted
-    Resource  string           // CRD 类型
-    Namespace string
-    Name      string
-    Object    interface{}      // CRD 对象
-    Timestamp time.Time
-}
-
-func (w *CRDWatcher) Start(ctx context.Context) error {
-    // 启动多个 Watch goroutine
-    go w.watchDGD(ctx)       // DynamoGraphDeployment
-    go w.watchDCD(ctx)       // DynamoComponentDeployment
-    go w.watchPods(ctx)      // Pod 状态
     
-    // 启动事件处理器
-    go w.processEvents(ctx)
+    // WebSocket hub
+    wsHub        *ws.Hub
     
-    <-ctx.Done()
-    return nil
+    // 指标
+    metrics      *WatchMetrics
+    
+    // 命名空间列表
+    namespaces   []string
 }
 
-func (w *CRDWatcher) watchDGD(ctx context.Context) error {
-    // 获取所有租户命名空间
-    namespaces, err := w.getTenantNamespaces()
+// NewCRDWatcher 创建 Watcher
+func NewCRDWatcher(config *rest.Config, db *gorm.DB, redis *redis.Client) (*CRDWatcher, error) {
+    ctx, cancel := context.WithCancel(context.Background())
+    
+    // 创建 dynamic client
+    dynClient, err := dynamic.NewForConfig(config)
     if err != nil {
-        return err
+        cancel()
+        return nil, err
     }
     
-    for _, ns := range namespaces {
-        go w.watchInNamespace(ctx, ns, "dynamographdeployments", "nvidia.com")
-    }
+    // 创建 SharedInformerFactory
+    // 设置 resyncPeriod=0 表示不主动定期同步，只处理变更
+    sharedFactory := informers.NewSharedInformerFactory(nil, 0)
     
-    <-ctx.Done()
-    return nil
+    // 创建 CRD Informers (使用 unstructured)
+    deploymentInformer := NewUnstructuredInformer(dynClient, DGDGVR, "", sharedFactory)
+    componentInformer := NewUnstructuredInformer(dynClient, DCDGVR, "", sharedFactory)
+    
+    // 创建 Pod Informer (使用 typed)
+    podInformer := sharedFactory.Core().V1().Pods().Informer()
+    
+    return &CRDWatcher{
+        ctx:               ctx,
+        cancel:            cancel,
+        dynClient:          dynClient,
+        sharedFactory:      sharedFactory,
+        deploymentInformer: deploymentInformer,
+        componentInformer:  componentInformer,
+        podInformer:       podInformer,
+        db:                db,
+        redis:             redis,
+    }, nil
 }
 
-func (w *CRDWatcher) watchInNamespace(ctx context.Context, ns, plural, group string) error {
-    resource := schema.GroupVersionResource{
-        Group:    group,
-        Version:   "v1alpha1",
-        Resource:  plural,
+// NewUnstructuredInformer 为 CRD 创建 Informer
+func NewUnstructuredInformer(
+    client dynamic.Interface,
+    gvr schema.GroupVersionResource,
+    namespace string,
+    factory informers.SharedInformerFactory,
+) cache.SharedIndexInformer {
+    lw := &cache.ListWatch{
+        ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+            return client.Resource(gvr).Namespace(namespace).List(ctx, options)
+        },
+        WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+            return client.Resource(gvr).Namespace(namespace).Watch(ctx, options)
+        },
     }
     
-    watcher, err := w.dynClient.Resource(resource).Namespace(ns).Watch(ctx, metav1.ListOptions{})
-    if err != nil {
-        return err
-    }
-    defer watcher.Stop()
-    
-    for {
-        select {
-        case <-ctx.Done():
-            return nil
-        case e := <-watcher.ResultChan():
-            w.eventCh <- &WatchEvent{
-                EventType: e.Type,
-                Resource:  plural,
-                Namespace: ns,
-                Name:      e.Object.(*unstructured.Unstructured).GetName(),
-                Object:    e.Object,
-                Timestamp: time.Now(),
-            }
-        }
-    }
+    return cache.NewSharedIndexInformer(lw, &unstructured.Unstructured{}, 0, cache.Indexers{})
 }
 ```
 
-### 7.5.4 状态同步处理
+### 7.5.5 事件处理
 
 ```go
-func (w *CRDWatcher) processEvents(ctx context.Context) {
-    for {
-        select {
-        case <-ctx.Done():
-            return
-        case e := <-w.eventCh:
-            switch e.Resource {
-            case "dynamographdeployments":
-                w.syncDGDStatus(e)
-            case "dynamocomponentdeployments":
-                w.syncDCDStatus(e)
-            case "pods":
-                w.syncPodStatus(e)
-            }
-        }
+// AddEventHandler 注册事件处理器
+func (w *CRDWatcher) AddEventHandler() error {
+    // DynamoGraphDeployment 事件处理
+    _, err := w.deploymentInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+        AddFunc: func(obj interface{}) {
+            w.onDGDAdded(obj)
+        },
+        UpdateFunc: func(oldObj, newObj interface{}) {
+            w.onDGDUpdated(oldObj, newObj)
+        },
+        DeleteFunc: func(obj interface{}) {
+            w.onDGDDeleted(obj)
+        },
+    })
+    if err != nil {
+        return err
     }
+    
+    // Pod 事件处理
+    _, err = w.podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+        AddFunc: func(obj interface{}) {
+            w.onPodAdded(obj)
+        },
+        UpdateFunc: func(oldObj, newObj interface{}) {
+            w.onPodUpdated(oldObj, newObj)
+        },
+        DeleteFunc: func(obj interface{}) {
+            w.onPodDeleted(obj)
+        },
+    })
+    return err
 }
 
-func (w *CRDWatcher) syncDGDStatus(e *WatchEvent) {
-    obj := e.Object.(*unstructured.Unstructured)
+func (w *CRDWatcher) onDGDUpdated(oldObj, newObj interface{}) {
+    unstruct := newObj.(*unstructured.Unstructured)
     
     // 解析状态
-    status, _ := obj.Object["status"].(map[string]interface{})
+    status, ok := unstruct.Object["status"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    
     state, _ := status["state"].(string)
     conditions, _ := status["conditions"].([]interface{})
     
     // 更新数据库
-    deploymentID := obj.GetName()
-    now := time.Now()
+    deploymentID := unstruct.GetName()
+    namespace := unstruct.GetNamespace()
     
-    w.db.Model(&Deployment{}).Where("k8s_name = ?", deploymentID).Updates(map[string]interface{}{
+    now := time.Now()
+    w.db.Model(&Deployment{}).Where("k8s_name = ? AND namespace = ?", deploymentID, namespace).Updates(map[string]interface{}{
         "status":         state,
         "conditions":     conditions,
         "last_sync_at":   now,
@@ -1202,21 +1279,106 @@ func (w *CRDWatcher) syncDGDStatus(e *WatchEvent) {
     
     // 更新 Redis 缓存
     cacheKey := fmt.Sprintf("deployment:status:%s", deploymentID)
-    w.redis.Set(ctx, cacheKey, map[string]interface{}{
+    w.redis.Set(w.ctx, cacheKey, map[string]interface{}{
         "status":     state,
+        "namespace":  namespace,
         "updated_at": now,
     }, 30*time.Second)
     
-    // 如果是 Deleted 事件，清理相关数据
-    if e.EventType == watch.Deleted {
-        w.handleDeploymentDeleted(deploymentID)
+    // 推送 WebSocket 事件
+    if w.wsHub != nil {
+        w.wsHub.Broadcast(&ws.StatusUpdate{
+            Type:      "deployment",
+            Name:      deploymentID,
+            Namespace: namespace,
+            Status:    state,
+            Timestamp: now,
+        })
     }
+    
+    // 记录指标
+    w.metrics.RecordSync("dynamographdeployment", "update")
 }
 ```
 
-### 7.5.5 事件推送 (可选)
+### 7.5.6 启动与缓存同步
 
-支持 WebSocket 实时推送状态变更到前端：
+```go
+// Start 启动 Watcher
+func (w *CRDWatcher) Start() error {
+    // 注册事件处理器
+    if err := w.AddEventHandler(); err != nil {
+        return err
+    }
+    
+    // 启动 SharedInformerFactory
+    go w.sharedFactory.Start(w.ctx.Done())
+    
+    // 等待缓存同步完成
+    if !cache.WaitForCacheSync(w.ctx.Done(), 
+        w.deploymentInformer.HasSynced,
+        w.componentInformer.HasSynced,
+        w.podInformer.HasSynced,
+    ) {
+        return fmt.Errorf("failed to sync informer cache")
+    }
+    
+    log.Info("CRD Watcher cache synced successfully")
+    
+    // 启动定期全量同步 (兜底)
+    go w.periodicFullSync()
+    
+    return nil
+}
+
+// Stop 停止 Watcher
+func (w *CRDWatcher) Stop() {
+    w.cancel()
+}
+
+// periodicFullSync 定期全量同步 (兜底机制)
+func (w *CRDWatcher) periodicFullSync() {
+    ticker := time.NewTicker(5 * time.Minute)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-w.ctx.Done():
+            return
+        case <-ticker.C:
+            w.fullSync()
+        }
+    }
+}
+
+func (w *CRDWatcher) fullSync() {
+    // 全量同步所有 DGD 状态到数据库
+    items := w.deploymentInformer.GetIndexer().List()
+    for _, item := range items {
+        unstruct := item.(*unstructured.Unstructured)
+        w.syncDGDToDatabase(unstruct)
+    }
+    
+    w.metrics.RecordFullSync()
+}
+```
+
+### 7.5.7 获取租户命名空间
+
+```go
+func (w *CRDWatcher) loadTenantNamespaces() error {
+    // 从数据库获取所有租户对应的命名空间
+    var namespaces []string
+    err := w.db.Model(&Tenant{}).Pluck("namespace", &namespaces).Error
+    if err != nil {
+        return err
+    }
+    w.namespaces = namespaces
+    return nil
+}
+```
+
+### 7.5.8 事件推送 (可选)
 
 ```go
 // pkg/ws/hub.go
@@ -1225,89 +1387,114 @@ type Hub struct {
     broadcast  chan *StatusUpdate
     register   chan *Client
     unregister chan *Client
+    mu         sync.RWMutex
 }
 
 type StatusUpdate struct {
     Type      string      `json:"type"`
-    Resource  string      `json:"resource"`   // "deployment", "component", "pod"
+    Resource  string      `json:"resource"`
     Name      string      `json:"name"`
     Namespace string      `json:"namespace"`
     Status    interface{} `json:"status"`
     Timestamp time.Time   `json:"timestamp"`
 }
 
+func (h *Hub) Broadcast(update *StatusUpdate) {
+    h.broadcast <- update
+}
+
 func (h *Hub) Run() {
     for {
         select {
         case update := <-h.broadcast:
-            // 广播到所有订阅该资源的客户端
+            h.mu.RLock()
             for client := range h.clients {
-                if client.subscribed[update.Resource+"/"+update.Namespace] {
-                    client.send <- update
+                select {
+                case client.send <- update:
+                default:
+                    // 客户端缓冲区满，跳过
                 }
             }
+            h.mu.RUnlock()
         }
     }
 }
 ```
 
-### 7.5.6 错误处理与恢复
+### 7.5.9 监控指标
 
 ```go
-func (w *CRDWatcher) watchWithRetry(ctx context.Context, watchFunc func() error) {
-    for {
-        err := watchFunc()
-        if err == nil {
-            return
-        }
-        
-        select {
-        case <-ctx.Done():
-            return
-        default:
-            // 指数退避重连
-            w.reconnectDelay = min(w.reconnectDelay*2, 5*time.Minute)
-            time.Sleep(w.reconnectDelay)
-        }
-    }
+// internal/watch/metrics.go
+type WatchMetrics struct {
+    syncTotal      *prometheus.CounterVec
+    syncDuration   *prometheus.HistogramVec
+    fullSyncTotal  prometheus.Counter
+    cacheSize      *prometheus.GaugeVec
 }
 
-// List 定期同步（兜底）
-func (w *CRDWatcher) periodicSync(ctx context.Context) {
-    ticker := time.NewTicker(5 * time.Minute)
-    defer ticker.Stop()
-    
-    for {
-        select {
-        case <-ctx.Done():
-            return
-        case <-ticker.C:
-            // 全量同步所有 CRD 状态
-            w.fullSync()
-        }
+func NewWatchMetrics(reg prometheus.Registerer) *WatchMetrics {
+    m := &WatchMetrics{
+        syncTotal: prometheus.NewCounterVec(
+            prometheus.CounterOpts{
+                Name: "llm_platform_crd_sync_total",
+                Help: "Total number of CRD sync events",
+            },
+            []string{"resource", "type"},
+        ),
+        syncDuration: prometheus.NewHistogramVec(
+            prometheus.HistogramOpts{
+                Name:    "llm_platform_crd_sync_duration_seconds",
+                Help:    "Duration of CRD sync operations",
+                Buckets: prometheus.DefBuckets,
+            },
+            []string{"resource"},
+        ),
+        fullSyncTotal: prometheus.NewCounter(
+            prometheus.CounterOpts{
+                Name: "llm_platform_crd_full_sync_total",
+                Help: "Total number of full CRD syncs",
+            },
+        ),
+        cacheSize: prometheus.NewGaugeVec(
+            prometheus.GaugeOpts{
+                Name: "llm_platform_informer_cache_size",
+                Help: "Size of informer local cache",
+            },
+            []string{"resource"},
+        ),
     }
+    reg.MustRegister(m.syncTotal, m.syncDuration, m.fullSyncTotal, m.cacheSize)
+    return m
+}
+
+func (m *WatchMetrics) RecordSync(resource, eventType string) {
+    m.syncTotal.WithLabelValues(resource, eventType).Inc()
+}
+
+func (m *WatchMetrics) RecordSyncDuration(resource string, duration time.Duration) {
+    m.syncDuration.WithLabelValues(resource).Observe(duration.Seconds())
+}
+
+func (m *WatchMetrics) RecordFullSync() {
+    m.fullSyncTotal.Inc()
+}
+
+func (m *WatchMetrics) SetCacheSize(resource string, size int) {
+    m.cacheSize.WithLabelValues(resource).Set(float64(size))
 }
 ```
 
-### 7.5.7 监控指标
+### 7.5.10 与原始 Watch 的对比
 
-```go
-// Watch 服务相关指标
-func (w *CRDWatcher) recordMetrics() {
-    // 指标采集
-    go func() {
-        for {
-            m.watchEventsTotal.WithLabelValues("dynamographdeployment", "added")
-            m.watchEventsTotal.WithLabelValues("dynamographdeployment", "modified")
-            m.watchEventsTotal.WithLabelValues("dynamographdeployment", "deleted")
-            
-            m.watchLagSeconds.WithLabelValues("dynamographdeployment").Observe(lag)
-            
-            time.Sleep(30 * time.Second)
-        }
-    }()
-}
-```
+| 特性 | 原始 Watch | client-go Informer |
+|------|-----------|-------------------|
+| **缓存** | 无，需自己实现 | 内置 Store，自动缓存 |
+| **重连** | 需手动实现 | 自动处理 |
+| **去重** | 无 | DeltaFIFO 自动去重 |
+| **索引** | 无 | Indexer 支持 |
+| **同步等待** | 需手动等待 | HasSynced() 机制 |
+| **资源消耗** | 高（频繁请求） | 低（增量变更） |
+| **实现复杂度** | 低 | 中 |
 
 ---
 
